@@ -6,13 +6,13 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360   # More reasonable than 3600 (GitHub will kill very long jobs anyway)
+    timeout-minutes: 360
 
     steps:
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (testing only)
+          # Enable Remote Desktop and disable Network Level Authentication (for testing)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -20,7 +20,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name
+          # Remove existing firewall rule if present
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
 
           # Allow RDP on port 3389
@@ -35,9 +35,9 @@ jobs:
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
               Special = ([char[]](33..47) + [char[]](58..64) +
                          [char[]](91..96) + [char[]](123..126))
           }
@@ -49,7 +49,7 @@ jobs:
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Remove user if it already exists (in case of re-runs)
+          # Remove existing user if present
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
               Remove-LocalUser -Name "RDP" -Confirm:$false
           }
@@ -58,7 +58,7 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
-          # Correct way to write to GITHUB_ENV on Windows / PowerShell
+          # Correct way to write env var on Windows PowerShell
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
@@ -81,30 +81,41 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
-          # Give the service a moment to start
-          Start-Sleep -Seconds 5
+          # Give the service time to start
+          Start-Sleep -Seconds 8
 
       - name: Establish Tailscale Connection
         shell: pwsh
         run: |
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          \( tsPath = " \){env:ProgramFiles}\Tailscale\tailscale.exe"
 
-          # Bring up Tailscale
-          & \( tsExe up --authkey= \){{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes
+          if (-not (Test-Path $tsPath)) {
+              Write-Error "Tailscale executable not found at $tsPath"
+              Get-ChildItem "${env:ProgramFiles}\Tailscale" -ErrorAction SilentlyContinue
+              exit 1
+          }
 
-          # Wait for Tailscale to assign an IP
+          Write-Host "Found Tailscale at: $tsPath"
+
+          & $tsPath up `
+              --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+              --hostname="gh-runner-$env:GITHUB_RUN_ID" `
+              --accept-routes
+
+          # Wait for Tailscale IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 15) {
-              $tsIP = & $tsExe ip -4 2>$null
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = & $tsPath ip -4 2>$null
               if ($tsIP) { break }
               Start-Sleep -Seconds 5
               $retries++
-              Write-Host "Waiting for Tailscale IP... ($retries)"
+              Write-Host "Waiting for Tailscale IP... attempt $retries"
           }
 
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned after retries. Exiting."
+              & $tsPath status
               exit 1
           }
 
@@ -134,16 +145,7 @@ jobs:
           Write-Host "=================="
           Write-Host ""
 
-          # Keep the runner alive (cancel the workflow manually when done)
           while ($true) {
               Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP still active - cancel the workflow to stop"
-              Start-Sleep -Seconds 300
-          }          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
